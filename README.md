@@ -2,7 +2,9 @@
 Advanced Soundboard Interface for recording, renaming mp3 and wav files, replaying, button comtomization, presets, and automated responses.
 
 =====================================================
+
 ADVANCED SOUNDBOARD INTERFACE - Presented by: DuncanAndFriends
+
 =====================================================
 
 Thank you for downloading the Advanced Soundboard Interface!
