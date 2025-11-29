@@ -6,7 +6,7 @@ import random
 import time
 import subprocess
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, PhotoImage
+from tkinter import filedialog, messagebox, ttk, PhotoImage, simpledialog
 from tkinter import font as tkfont
 
 import numpy as np
@@ -48,13 +48,15 @@ else:
     BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
 CONFIG_FILE = os.path.join(BASE_DIR, "soundboard_config.json")
+PLUGIN_DIR = os.path.join(BASE_DIR, "plugins")
+os.makedirs(PLUGIN_DIR, exist_ok=True)
 
 # ---------- COLORS / FONTS ----------
 BG = "#4b4b4b"          # main background
 SECTION_BG = "#5a5a5a"  # group boxes
 BTN_BG = "#7a7a7a"      # sound buttons
 BTN_FG = "white"
-HEADER_FONT = ("Segoe UI", 18, "bold")   # thinner style than Arial bold
+HEADER_FONT = ("Segoe UI", 18, "bold")
 
 # ---------- AUDIO GLOBALS ----------
 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
@@ -136,6 +138,13 @@ def play_audio_file(path: str, semitones: float = 0.0):
             print("Playback error:", e)
 
 
+def stop_all_audio():
+    """Stop any currently playing sound."""
+    with audio_lock:
+        if current_channel.get_busy():
+            current_channel.stop()
+
+
 # ---------- AUTO RENAMER (Recordings Folder) ----------
 class AutoRenamer(threading.Thread):
     """
@@ -196,19 +205,11 @@ class AutoRenamer(threading.Thread):
             cleaned = sanitize_filename_spaces(text)
             new_path = os.path.join(self.folder, cleaned + ".mp3")
             new_path = next_unique_path(new_path)
-            base, ext = os.path.splitext(path)
 
-            # If not mp3, just rename + change extension (simple; original data stays same)
-            if ext.lower() != ".mp3":
-                try:
-                    os.rename(path, new_path)
-                except Exception as e:
-                    print("Rename error:", e)
-            else:
-                try:
-                    os.rename(path, new_path)
-                except Exception as e:
-                    print("Rename error:", e)
+            try:
+                os.rename(path, new_path)
+            except Exception as e:
+                print("Rename error:", e)
         except Exception as e:
             print("handle_file error:", e)
 
@@ -332,9 +333,11 @@ class SoundboardApp:
         self.root.configure(bg=BG)
         self.root.geometry("1100x700")
 
+        # space bar stops sound
+        self.root.bind("<space>", self.on_space_bar)
+
         # load logo
         self.logo_img = self.load_duck_logo()
-
         if self.logo_img:
             self.root.iconphoto(False, self.logo_img)
 
@@ -342,17 +345,22 @@ class SoundboardApp:
         self.config = load_config()
         self.categories = self.config["categories"]
         self.all_sounds_folder = self.config.get("all_sounds_folder", "")
-        self.recordings_folder = self.config.get("recordings_folder", os.path.join(BASE_DIR, "recordings"))
+        self.recordings_folder = self.config.get(
+            "recordings_folder", os.path.join(BASE_DIR, "recordings")
+        )
 
         # state
-        self.button_size_var = tk.IntVar(value=10)   # smaller height
-        self.pitch_var = tk.IntVar(value=50)         # 0..100, 50 center
-        self.volume_var = tk.IntVar(value=100)       # 0..200, 100 normal
+        self.button_size_var = tk.IntVar(value=8)   # fixed button font size
+        self.pitch_var = tk.IntVar(value=50)        # 0..100, 50 center
+        self.volume_var = tk.IntVar(value=100)      # 0..200, 100 normal
         self.bot_enabled = tk.BooleanVar(value=False)
 
         self.is_recording = False
         self.record_stream = None
         self.record_frames = []
+
+        # drag-reorder state
+        self.drag_cat_key = None
 
         # voice bot
         self.bot = VoiceBot(self.get_current_pitch_semitones, self.get_all_audio_files)
@@ -367,6 +375,10 @@ class SoundboardApp:
         self.rec_menu.add_command(label="Delete...", command=self._rec_delete)
         self.rec_menu.add_command(label="Open Folder", command=self._rec_open_folder)
         self._rec_menu_target = None
+
+        # index of all sound buttons for search
+        # each entry: {"name": <lowercase label>, "widget": button, "orig_bg": color}
+        self.button_index = []
 
         self.build_ui()
         self.refresh_soundboard()
@@ -450,7 +462,7 @@ class SoundboardApp:
             activeforeground="white"
         ).pack(side="left", padx=10)
 
-        # Pitch / Volume / Button size
+        # Pitch / Volume
         tk.Scale(
             top,
             from_=0,
@@ -478,20 +490,6 @@ class SoundboardApp:
             highlightthickness=0,
         ).pack(side="left", padx=10)
 
-        tk.Scale(
-            top,
-            from_=8,
-            to=18,
-            orient="horizontal",
-            label="Button Size",
-            variable=self.button_size_var,
-            command=lambda v: self.refresh_soundboard(),
-            bg=BG,
-            fg="white",
-            troughcolor="#3c3c3c",
-            highlightthickness=0,
-        ).pack(side="left", padx=10)
-
         # Record + recordings folder
         self.record_btn = tk.Button(
             top,
@@ -510,7 +508,7 @@ class SoundboardApp:
             fg=BTN_FG
         ).pack(side="left", padx=5)
 
-        # Clear Soundboard (far right)
+        # Right side: Search + Clear
         tk.Button(
             top,
             text="Clear Soundboard",
@@ -519,7 +517,15 @@ class SoundboardApp:
             fg="white"
         ).pack(side="right", padx=5)
 
-        # Scrollable area
+        tk.Button(
+            top,
+            text="Search",
+            command=self.search_sounds,
+            bg=BTN_BG,
+            fg=BTN_FG
+        ).pack(side="right", padx=5)
+
+        # Scrollable area (whole board)
         outer = tk.Frame(self.root, bg=BG)
         outer.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -548,26 +554,54 @@ class SoundboardApp:
 
     # ---------- SOUND BOARD BUILD ----------
     def refresh_soundboard(self):
-        # clear
+        # clear index & UI
+        self.button_index = []
         for w in self.inner.winfo_children():
             w.destroy()
 
-        # Recordings section
-        self.add_recordings_section()
+        # Recordings section (full-width at top)
+        rec_container = tk.Frame(self.inner, bg=BG)
+        rec_container.pack(fill="x", pady=(0, 10))
+        self.add_recordings_section(rec_container)
 
-        # Category sections 1..20
+        # Categories grid container
+        cat_container = tk.Frame(self.inner, bg=BG)
+        cat_container.pack(fill="both", expand=True)
+
+        # create 4 vertical columns
+        max_cat_cols = 4
+        columns = []
+        for c in range(max_cat_cols):
+            col_frame = tk.Frame(cat_container, bg=BG)
+            col_frame.grid(row=0, column=c, sticky="n", padx=0, pady=0)
+            cat_container.grid_columnconfigure(c, weight=1, uniform="catcol")
+            columns.append(col_frame)
+
+        # Build category list: 20 categories + All Sounds as last
+        category_defs = []
         for i in range(1, 21):
             name = f"Category {i}"
             folder = self.categories.get(name, "")
-            self.add_category_section(name, folder, recursive=False)
+            category_defs.append((name, folder, False, False))
+        category_defs.append(("All Sounds", self.all_sounds_folder, True, True))
 
-        # All Sounds (old RANDOM)
-        folder = self.all_sounds_folder
-        self.add_category_section("All Sounds", folder, recursive=True, show_description=True)
+        btn_cols = 2
 
-    def add_recordings_section(self):
+        for idx, (name, folder, recursive, show_desc) in enumerate(category_defs):
+            col = idx % max_cat_cols
+            parent_col = columns[col]
+            self.add_category_section(
+                parent=parent_col,
+                name=name,
+                folder=folder,
+                recursive=recursive,
+                show_description=show_desc,
+                btn_cols=btn_cols
+            )
+
+    def add_recordings_section(self, parent):
         section = tk.LabelFrame(
-            self.inner,
+            parent,
             text=f"Recordings → {self.recordings_folder}",
             bg=SECTION_BG,
             fg="white"
@@ -613,7 +647,7 @@ class SoundboardApp:
         grid = tk.Frame(section, bg=SECTION_BG)
         grid.pack(fill="x", padx=5, pady=5)
 
-        max_cols = 6
+        max_cols = 2
         row = col = 0
         btn_font = ("Segoe UI", self.button_size_var.get(), "bold")
 
@@ -632,28 +666,59 @@ class SoundboardApp:
                 bd=1,
                 font=btn_font,
                 height=1,
-                width=18
+                anchor="w",   # left-align text
+                padx=6
             )
             b.grid(row=row, column=col, padx=3, pady=3, sticky="ew")
+
+            # index for search (store original bg)
+            self.button_index.append({"name": short.lower(), "widget": b, "orig_bg": b.cget("bg")})
 
             # right-click menu
             b.bind("<Button-3>", lambda e, p=full: self.show_rec_menu(e, p))
 
-            grid.columnconfigure(col, weight=1)
+            grid.columnconfigure(col, weight=1, uniform="recbtn")
             col += 1
             if col >= max_cols:
                 col = 0
                 row += 1
 
-    def add_category_section(self, name, folder, recursive=False, show_description=False):
-        section = tk.LabelFrame(
-            self.inner,
-            text=f"{name} → {folder or '(no folder)'}",
-            bg=SECTION_BG,
-            fg="white"
-        )
-        section.pack(fill="x", pady=5, padx=5, anchor="n")
+    def add_category_section(
+        self,
+        parent,
+        name,
+        folder,
+        recursive=False,
+        show_description=False,
+        btn_cols=2
+    ):
+        # Decide display name: folder name only (no path)
+        if folder and os.path.isdir(folder):
+            display_name = os.path.basename(folder.rstrip("/\\"))
+            if not display_name:
+                display_name = "(folder)"
+        else:
+            display_name = "(no folder)"
 
+        # Outer label frame (category box) – label text = folder name, white, bigger
+        label_font_size = self.button_size_var.get() + 2
+        section = tk.LabelFrame(
+            parent,
+            text=display_name,
+            bg=SECTION_BG,
+            fg="white",
+            font=("Segoe UI", label_font_size, "bold")
+        )
+        section.pack(fill="x", padx=5, pady=5, anchor="n")
+
+        # mark this frame with its category key (for drag/drop)
+        section.cat_key = name
+
+        # Bind drag handlers on the category frame (header area)
+        section.bind("<Button-1>", self.on_cat_press)
+        section.bind("<ButtonRelease-1>", self.on_cat_release)
+
+        # Top bar inside category
         top_bar = tk.Frame(section, bg=SECTION_BG)
         top_bar.pack(fill="x", padx=5, pady=2)
 
@@ -671,7 +736,7 @@ class SoundboardApp:
                 text="This category automatically includes all audio inside this folder and any of its subfolders.",
                 bg=SECTION_BG,
                 fg="white",
-                wraplength=800,
+                wraplength=220,
                 justify="left"
             ).pack(anchor="w", padx=10, pady=(0, 5))
 
@@ -684,7 +749,7 @@ class SoundboardApp:
             ).pack(anchor="w", padx=10, pady=5)
             return
 
-        # collect files
+        # Collect files
         files = []
         if recursive:
             for root, dirs, fns in os.walk(folder):
@@ -709,17 +774,17 @@ class SoundboardApp:
             ).pack(anchor="w", padx=10, pady=5)
             return
 
-        grid = tk.Frame(section, bg=SECTION_BG)
-        grid.pack(fill="x", padx=5, pady=5)
+        # Simple grid of buttons; section grows to fit content
+        btn_frame = tk.Frame(section, bg=SECTION_BG)
+        btn_frame.pack(fill="both", expand=True, padx=2, pady=5)
 
-        max_cols = 6
-        row = col = 0
         btn_font = ("Segoe UI", self.button_size_var.get(), "bold")
 
+        row = col = 0
         for label, full in sorted(files, key=lambda x: x[0].lower()):
             short = self.shorten_label(label)
             b = tk.Button(
-                grid,
+                btn_frame,
                 text=short,
                 command=lambda p=full: self.play_button_clicked(p),
                 bg=BTN_BG,
@@ -728,19 +793,107 @@ class SoundboardApp:
                 bd=1,
                 font=btn_font,
                 height=1,
-                width=18
+                anchor="w",   # left-align text
+                padx=6
             )
             b.grid(row=row, column=col, padx=3, pady=3, sticky="ew")
-            grid.columnconfigure(col, weight=1)
+            btn_frame.grid_columnconfigure(col, weight=1, uniform=f"catbtn_{id(parent)}")
+
+            # index for search
+            self.button_index.append({"name": short.lower(), "widget": b, "orig_bg": b.cget("bg")})
 
             col += 1
-            if col >= max_cols:
+            if col >= btn_cols:
                 col = 0
                 row += 1
 
+    # ---------- DRAG & DROP REORDER ----------
+    def _find_cat_frame(self, widget):
+        """Walk up parents to find a widget that has cat_key."""
+        while widget is not None:
+            if hasattr(widget, "cat_key"):
+                return widget
+            widget = widget.master
+        return None
+
+    def on_cat_press(self, event):
+        frame = self._find_cat_frame(event.widget)
+        if frame is None:
+            return
+        self.drag_cat_key = frame.cat_key
+
+    def on_cat_release(self, event):
+        if self.drag_cat_key is None:
+            return
+
+        # Find target category under mouse
+        target_widget = self.root.winfo_containing(event.x_root, event.y_root)
+        frame = self._find_cat_frame(target_widget)
+        source_key = self.drag_cat_key
+        self.drag_cat_key = None
+
+        if frame is None or not hasattr(frame, "cat_key"):
+            return
+
+        target_key = frame.cat_key
+        if target_key == source_key:
+            return
+
+        # Swap folders between source and target categories
+        source_folder = self._get_cat_folder(source_key)
+        target_folder = self._get_cat_folder(target_key)
+
+        self._set_cat_folder(source_key, target_folder)
+        self._set_cat_folder(target_key, source_folder)
+
+        save_config(self.config)
+        self.refresh_soundboard()
+
+    def _get_cat_folder(self, key: str) -> str:
+        if key == "All Sounds":
+            return self.all_sounds_folder
+        return self.categories.get(key, "")
+
+    def _set_cat_folder(self, key: str, folder: str):
+        if key == "All Sounds":
+            self.all_sounds_folder = folder
+            self.config["all_sounds_folder"] = folder
+        else:
+            self.categories[key] = folder
+            self.config["categories"] = self.categories
+
+    # ---------- SEARCH ----------
+    def search_sounds(self):
+        query = simpledialog.askstring("Search", "Enter text to highlight:")
+
+        # Reset all to original colors first
+        for entry in self.button_index:
+            try:
+                entry["widget"].configure(bg=entry["orig_bg"])
+            except Exception:
+                pass
+
+        if not query:
+            return
+
+        q = query.lower().strip()
+        if not q:
+            return
+
+        # Highlight all matches; do NOT scroll
+        for entry in self.button_index:
+            if q in entry["name"]:
+                try:
+                    entry["widget"].configure(bg="#ffff88")
+                except Exception:
+                    pass
+
     # ---------- CATEGORY / FOLDER CHANGES ----------
     def change_category_folder(self, name: str):
-        new_folder = filedialog.askdirectory(title=f"Select folder for {name}")
+        new_folder = filedialog.askdirectory(
+            title=f"Select folder for {name}",
+            initialdir=PLUGIN_DIR
+        )
         if not new_folder:
             return
 
@@ -755,7 +908,10 @@ class SoundboardApp:
         self.refresh_soundboard()
 
     def change_recordings_folder(self):
-        new_folder = filedialog.askdirectory(title="Select Recordings Folder")
+        new_folder = filedialog.askdirectory(
+            title="Select Recordings Folder",
+            initialdir=PLUGIN_DIR
+        )
         if not new_folder:
             return
         self.recordings_folder = new_folder
@@ -784,7 +940,8 @@ class SoundboardApp:
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON Preset", "*.json")],
-            title="Save Preset As"
+            title="Save Preset As",
+            initialdir=PLUGIN_DIR
         )
         if not path:
             return
@@ -795,7 +952,7 @@ class SoundboardApp:
             "recordings_folder": self.recordings_folder,
             "pitch": self.pitch_var.get(),
             "volume": self.volume_var.get(),
-            "button_size": self.button_size_var.get()
+            "button_size": self.button_size_var.get(),
         }
         try:
             with open(path, "w") as f:
@@ -807,7 +964,8 @@ class SoundboardApp:
         path = filedialog.askopenfilename(
             defaultextension=".json",
             filetypes=[("JSON Preset", "*.json")],
-            title="Load Preset"
+            title="Load Preset",
+            initialdir=PLUGIN_DIR
         )
         if not path:
             return
@@ -823,7 +981,7 @@ class SoundboardApp:
         self.recordings_folder = data.get("recordings_folder", self.recordings_folder)
         self.pitch_var.set(data.get("pitch", 50))
         self.volume_var.set(data.get("volume", 100))
-        self.button_size_var.set(data.get("button_size", 10))
+        self.button_size_var.set(data.get("button_size", 8))
 
         self.config["categories"] = self.categories
         self.config["all_sounds_folder"] = self.all_sounds_folder
@@ -955,7 +1113,11 @@ class SoundboardApp:
         current = os.path.basename(self._rec_menu_target)
         name_no_ext, ext = os.path.splitext(current)
 
-        new_name = tk.simpledialog.askstring("Rename Recording", "New name:", initialvalue=name_no_ext)
+        new_name = simpledialog.askstring(
+            "Rename Recording",
+            "New name:",
+            initialvalue=name_no_ext
+        )
         if not new_name:
             return
 
@@ -992,6 +1154,11 @@ class SoundboardApp:
                 subprocess.call(["xdg-open", folder])
         except Exception as e:
             print("Open folder error:", e)
+
+    # ---------- SPACE BAR HANDLER ----------
+    def on_space_bar(self, event):
+        """Stop any playing sound when space bar is pressed."""
+        stop_all_audio()
 
     # ---------- CLOSE ----------
     def on_close(self):
