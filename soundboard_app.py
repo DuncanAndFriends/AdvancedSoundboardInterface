@@ -59,7 +59,8 @@ BTN_FG = "white"
 HEADER_FONT = ("Segoe UI", 18, "bold")
 
 # ---------- AUDIO GLOBALS ----------
-pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+# Increased buffer + 48kHz to reduce buzzing/crackling
+pygame.mixer.init(frequency=48000, size=-16, channels=2, buffer=2048)
 audio_lock = threading.Lock()
 current_channel = pygame.mixer.Channel(0)
 last_played = None
@@ -120,7 +121,8 @@ def play_audio_file(path: str, semitones: float = 0.0):
 
         try:
             snd = pygame.mixer.Sound(path)
-            arr = pygame.sndarray.array(snd)
+            # Make sure array is contiguous to avoid weird noise on some systems
+            arr = np.ascontiguousarray(pygame.sndarray.array(snd))
 
             if semitones != 0:
                 arr = pitch_shift_array(arr, semitones)
